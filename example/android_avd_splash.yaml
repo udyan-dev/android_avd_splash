@@ -1,0 +1,53 @@
+# Copy this file to your project root and run:
+#
+#     dart run android_avd_splash:create
+#
+# `source:` is the only required option; every default below follows the
+# platform's splash screen guidelines.
+android_avd_splash:
+  # The animation to convert: .json for Lottie, .gif for an animated GIF.
+  source: assets/splash.json
+
+  # Resource name stem. The drawable becomes @drawable/splash and the launch
+  # theme @style/Theme.Splash.
+  name: splash
+
+  # One opaque colour behind the icon, #RRGGBB or #AARRGGBB. Left out, a GIF's
+  # own background is used and a Lottie animation gets white.
+  background: "#FFFFFFFF"
+  background_night: "#FF000000"
+
+  # Optional circle behind the icon, for contrast against the background.
+  # icon_background: "#FF1F62FF"
+
+  # Plays the animation over this many milliseconds instead of its own length.
+  # The guidelines ask for 1000 or less on phones.
+  duration_ms: 1000
+
+  # Icon geometry in dp. The platform masks the outer third of the canvas, so
+  # the artwork has to stay inside canvas_dp / 3 of the centre.
+  canvas_dp: 288
+  safe_radius_dp: 96
+
+  # Morphing Bezier segments allowed per frame. Accuracy is spent up to this
+  # limit and no further, because morphing is what costs the renderer work.
+  # 0 lifts the limit.
+  max_morph: 400
+
+  # Ask Android 13+ to show the icon even when the app is opened from a
+  # shortcut or a notification.
+  icon_preferred: true
+
+  # Where the Android module is, and how much of the wiring to do.
+  android_dir: android
+  patch_manifest: true
+  patch_activity: true
+
+  # Replay the written XML against the source and report the accuracy.
+  verify: true
+
+  # GIF only.
+  # smooth: 0.6                # blur in source pixels before tracing
+  # colors: ["#FF1F62FF"]      # paint colours to use instead of the GIF's own
+  # trim: true                 # drop a blank lead-in and a static tail
+  # gradients: true            # fill a region with a gradient when it needs one
