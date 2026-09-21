@@ -29,7 +29,7 @@ class Winding {
         if (area.abs() < 1e-9) continue; // a collapsed loop fills nothing either way
         var depth = 0;
         for (var j = 0; j < count; j++) {
-          if (j != i && _surrounds(polygons[j], polygons[i])) depth++;
+          if (j != i && surrounds(polygons[j], polygons[i])) depth++;
         }
         final wanted = depth.isEven ? 1 : -1;
         votes[i] += area * wanted < 0 ? 1 : -1;
@@ -69,11 +69,43 @@ List<Point> flattenLoop(Curve loop) => loop.length < 4 ? loop : flatten(loop);
 /// in the ring, so a point there would count the ring's own hole as a parent
 /// and invert it. Three vertices vote, so one landing on a shared edge cannot
 /// decide it.
-bool _surrounds(List<Point> outer, List<Point> inner) {
+bool surrounds(List<Point> outer, List<Point> inner) {
   if (outer.length < 3 || inner.isEmpty) return false;
   var yes = 0;
   for (var k = 0; k < 3; k++) {
     if (contains(outer, inner[(inner.length * k) ~/ 3])) yes++;
   }
   return yes >= 2;
+}
+
+/// [loop] pushed [distance] outwards, away from the area it encloses.
+///
+/// Every point moves along the normal of the polyline through its neighbours,
+/// so the point count - and with it the path's command sequence - is untouched:
+/// a clip built from these loops still morphs. The control points move with
+/// their anchors, which traces the offset of a curve closely enough at the
+/// widths a stroke has, and exactly on the straight segments.
+Curve outsetLoop(Curve loop, double distance) {
+  if (loop.length < 4 || distance <= 0) return loop;
+  // Which way is out: a loop that turns one way encloses what is inside it,
+  // and the other way round the same normal points the other way.
+  final side = signedArea(flattenLoop(loop)) >= 0 ? 1.0 : -1.0;
+  final out = <Point>[];
+  for (var i = 0; i < loop.length; i++) {
+    // Coincident points - a handle parked on its anchor - carry no direction,
+    // so the tangent comes from the nearest neighbours that differ.
+    var before = loop[i], after = loop[i];
+    for (var step = 1; step < loop.length && before == loop[i]; step++) {
+      before = loop[(i - step) % loop.length];
+    }
+    for (var step = 1; step < loop.length && after == loop[i]; step++) {
+      after = loop[(i + step) % loop.length];
+    }
+    final tangent = after - before;
+    final length = tangent.length;
+    out.add(length == 0
+        ? loop[i]
+        : loop[i] + Point(tangent.y / length, -tangent.x / length) * (distance * side));
+  }
+  return out;
 }

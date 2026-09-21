@@ -69,8 +69,6 @@ String _style(SplashConfig config, int durationMs,
           '@color/${name}_background</item>')
       ..writeln('        <item name="android:windowSplashScreenAnimatedIcon">'
           '@drawable/$name</item>')
-      // Android 12 reads the length from here; Android 13 and up read it from
-      // the drawable, and cap what it reports back to the app either way.
       ..writeln('        <item name="android:windowSplashScreenAnimationDuration">'
           '$durationMs</item>');
     if (config.iconBackground != null) {

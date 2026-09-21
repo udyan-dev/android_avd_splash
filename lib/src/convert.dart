@@ -9,6 +9,7 @@ import 'gif.dart';
 import 'lottie.dart';
 import 'model.dart';
 import 'raster.dart';
+import 'svg.dart';
 import 'verify.dart';
 import 'write.dart';
 
@@ -33,6 +34,11 @@ class Generated {
   /// How far the animation's own length was stretched to reach the length that
   /// was asked for. One when it plays at its own speed.
   final double timeScale;
+
+  /// The colour of a full-bleed plate the artwork was drawn on, when it had
+  /// one. It is not in the drawable: the platform masks the icon to a circle,
+  /// so a plate belongs to the splash background instead.
+  int? get plate => drawable.plate;
 
   /// Resource files, keyed by path relative to `res/`.
   final Map<String, String> files;
@@ -74,9 +80,11 @@ Generated generate(Uint8List gifBytes, {Options options = const Options()}) {
     quality = best == null ? coarsest : bestQuality;
   }
   final played = avd.drawable;
-  final drawable = played.retimed(options.durationMs ?? played.durationMs);
+  final unsupported = <String>{};
+  final drawable =
+      withinStringLimit(played.retimed(options.durationMs ?? played.durationMs), unsupported);
   return Generated(drawable, render(drawable), quality,
-      avd: avd, timeScale: drawable.durationMs / played.durationMs);
+      avd: avd, unsupported: unsupported, timeScale: drawable.durationMs / played.durationMs);
 }
 
 /// Converts a Lottie animation, structure for structure. Nothing is traced and
@@ -84,10 +92,30 @@ Generated generate(Uint8List gifBytes, {Options options = const Options()}) {
 /// exactly - which no raster source can.
 Generated convertLottie(Uint8List jsonBytes, {Options options = const Options()}) {
   final lottie = Lottie.parse(jsonBytes);
-  final played = lottie.toDrawable(options.name, options.canvasDp, options.safeRadiusDp);
-  final drawable = played.retimed(options.durationMs ?? played.durationMs);
+  final played =
+      lottie.toDrawable(options.name, options.canvasDp, options.safeRadiusDp, trim: options.trim);
+  final unsupported = {...lottie.unsupported};
+  final drawable =
+      withinStringLimit(played.retimed(options.durationMs ?? played.durationMs), unsupported);
   return Generated(drawable, render(drawable), 0,
-      unsupported: lottie.unsupported, timeScale: drawable.durationMs / played.durationMs);
+      unsupported: unsupported, timeScale: drawable.durationMs / played.durationMs);
+}
+
+/// Converts an animated SVG, structure for structure. Like Lottie it is vector
+/// in and vector out, so a file whose features Android can express converts
+/// exactly.
+Generated convertSvg(Uint8List svgBytes, {Options options = const Options()}) {
+  final svg = Svg.parse(svgBytes);
+  final played =
+      svg.toDrawable(options.name, options.canvasDp, options.safeRadiusDp, trim: options.trim);
+  final unsupported = {...svg.unsupported};
+  // A path longer than an Android resource string is split before it is
+  // written: the platform answers one that is too long by silently showing the
+  // launcher icon instead of the animation.
+  final drawable =
+      withinStringLimit(played.retimed(options.durationMs ?? played.durationMs), unsupported);
+  return Generated(drawable, render(drawable), 0,
+      unsupported: unsupported, timeScale: drawable.durationMs / played.durationMs);
 }
 
 /// Replays the generated XML against the GIF frames it came from.
@@ -155,7 +183,7 @@ List<String> write(Generated generated, String resDir) {
 ///
 /// Both sides are vector here, so there is no pixel ceiling to fall short of:
 /// anything below 1.0000 is a conversion fault, not a limit of the format.
-Report checkLottie(Generated generated, {int samplesPerSecond = 30, double pixelsPerDp = 2}) {
+Report checkVector(Generated generated, {int samplesPerSecond = 30, double pixelsPerDp = 2}) {
   final drawable = generated.drawable;
   final size = (drawable.canvasDp * pixelsPerDp).round();
   final times = <int>[];
@@ -170,16 +198,15 @@ Report checkLottie(Generated generated, {int samplesPerSecond = 30, double pixel
   for (final t in times) {
     final mask = Uint8List(size * size);
     final outline = <Point>[];
-    for (final path in drawable.at(t)) {
+    for (final path in drawable.at(t, fillsOnly: false)) {
       List<List<Point>> scaled(List<List<Point>> loops) => [
             for (final loop in loops)
               [for (final p in loop) Point(p.x * pixelsPerDp, p.y * pixelsPerDp)],
           ];
-      final loops = scaled(path.loops);
-      for (final loop in loops) {
-        outline.addAll(loop);
+      for (final loop in path.loops) {
+        outline.addAll([for (final p in loop) Point(p.x * pixelsPerDp, p.y * pixelsPerDp)]);
       }
-      final painted = rasterise(loops, size, size);
+      final painted = rasterise(scaled(path.painted), size, size);
       for (final clip in path.clips) {
         // Non-zero because that is the only rule a `<clip-path>` has.
         final allowed = rasterise(scaled(clip), size, size, nonZero: true);
@@ -197,6 +224,11 @@ Report checkLottie(Generated generated, {int samplesPerSecond = 30, double pixel
   return verify(generated.files, masks, contours, 1, times, drawable.durationMs, size, size,
       1 / pixelsPerDp, const Point(0, 0));
 }
+
+/// The vector replay, under the name the first release gave it.
+@Deprecated('Use checkVector: it replays an SVG the same way. Removed in 2.0.0.')
+Report checkLottie(Generated generated, {int samplesPerSecond = 30, double pixelsPerDp = 2}) =>
+    checkVector(generated, samplesPerSecond: samplesPerSecond, pixelsPerDp: pixelsPerDp);
 
 /// Finds the `res` directory of a Flutter or Android project.
 String? findResDir(String root) {

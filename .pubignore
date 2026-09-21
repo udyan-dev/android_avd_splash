@@ -1,1 +1,8 @@
-doc/
+# `dart doc` writes here, and the recordings are repository assets: pub.dev
+# renders the still beside the README and rewrites the links beside it to the
+# repository, so the videos are there to watch without shipping them to
+# everyone who installs the package.
+doc/api/
+doc/demo_svg.mp4
+doc/demo_gif.mp4
+doc/demo_lottie.mp4

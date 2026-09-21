@@ -332,10 +332,14 @@ Avd assemble(Traced traced, Options options) {
   final scale = traced.scale;
   final offset = traced.offset;
 
+  final palette = [for (final layer in traced.separation.layers) layer.color];
   final groups = [
     for (final region in traced.regions)
-      _region(region, times, duration, indices, gif, scale, offset, options),
+      if (_region(region, times, duration, indices, gif, scale, offset, options, palette)
+          case final group?)
+        group,
   ];
+  if (groups.isEmpty) throw StateError('nothing left to animate above --min-area');
 
   // The scale was chosen from the traced contours, but a fitted outline can sit
   // a tolerance outside them. Measure what was actually built and shrink it to
@@ -447,8 +451,8 @@ class _Track {
   void lose() => velocity = const Point(0, 0);
 }
 
-Group _region(Region region, List<int> times, int duration, List<int> frames, Gif gif, double scale,
-    Point offset, Options options) {
+Group? _region(Region region, List<int> times, int duration, List<int> frames, Gif gif,
+    double scale, Point offset, Options options, List<int> palette) {
   final name = region.name;
   final color = region.color;
   final slot = region.slot;
@@ -494,7 +498,12 @@ Group _region(Region region, List<int> times, int duration, List<int> frames, Gi
     if (fit == null || fit.residual > options.rigidTolerance) rigid = false;
     motions.add(fit == null ? Motion.identity : Motion.of(fit, pivot));
   }
-  final motionKeys = _reduceMotion(times, motions, pivot, reference, options.keyframeTolerance);
+  // GIF frames are held images, not tweened vector keyframes. Keeping every
+  // frame as a discrete key prevents Android from inventing in-between path
+  // geometry that never existed in the source (and can self-intersect badly).
+  final motionKeys = [
+    for (var f = 0; f < motions.length; f++) Key(times[f], motions[f], Easing.hold),
+  ];
 
   // The leftover shape, measured in the group's own space against the motion
   // track as it will actually be interpolated. A frame where the region is
@@ -512,14 +521,17 @@ Group _region(Region region, List<int> times, int duration, List<int> frames, Gi
   ];
   final shapeKeys = rigid
       ? [Key(times[referenceIndex], curves[referenceIndex])]
-      : _reduceShapes(times, residuals, curves, [for (final shape in slot) shape != null],
-          motionKeys, pivot, options);
+      : [
+          for (var f = 0; f < residuals.length; f++) Key(times[f], residuals[f], Easing.hold),
+        ];
 
   // The fill is read off the GIF in canvas space; the path is drawn in the
   // group's space, so a gradient axis has to come back through the transform.
-  final measured = options.gradients && options.colors == null
-      ? fitFill(gif, frames[referenceIndex], curves[referenceIndex], scale, offset, color)
-      : Paint(color: color);
+  final measured = options.colors != null
+      ? Paint(color: color)
+      : fitFill(gif, frames[referenceIndex], curves[referenceIndex], scale, offset, color,
+          palette: palette, gradients: options.gradients);
+  if (measured == null) return null;
   final gradient = measured.gradient;
   final fill = gradient == null
       ? measured
@@ -539,13 +551,17 @@ Group _region(Region region, List<int> times, int duration, List<int> frames, Gi
   return Group(
     '${name}_group',
     pivot: pivot,
-    translateX: Track([for (final k in motionKeys) Key(k.timeMs, k.value.tx)]),
-    translateY: Track([for (final k in motionKeys) Key(k.timeMs, k.value.ty)]),
-    scaleX: Track([for (final k in motionKeys) Key(k.timeMs, k.value.scale)]),
-    scaleY: Track([for (final k in motionKeys) Key(k.timeMs, k.value.scale)]),
-    rotation: Track([for (final k in motionKeys) Key(k.timeMs, k.value.degrees)]),
+    translateX: Track([for (final k in motionKeys) Key(k.timeMs, k.value.tx, k.easing)]),
+    translateY: Track([for (final k in motionKeys) Key(k.timeMs, k.value.ty, k.easing)]),
+    scaleX: Track([for (final k in motionKeys) Key(k.timeMs, k.value.scale, k.easing)]),
+    scaleY: Track([for (final k in motionKeys) Key(k.timeMs, k.value.scale, k.easing)]),
+    rotation: Track([for (final k in motionKeys) Key(k.timeMs, k.value.degrees, k.easing)]),
     paths: [
-      PathItem(name, Track([for (final k in shapeKeys) Key(k.timeMs, k.value)]), fill),
+      PathItem(
+        name,
+        Track([for (final k in shapeKeys) Key(k.timeMs, k.value, k.easing)]),
+        fill.asEvenOdd(),
+      ),
     ],
   );
 }
@@ -594,48 +610,8 @@ Paint _shrinkPaint(Paint paint, double k, Point centre) {
     gradient: Gradient(gradient.type, move(gradient.start), move(gradient.end), gradient.stops,
         gradient.radius * k),
     alpha: paint.alpha,
+    evenOdd: paint.evenOdd,
   );
-}
-
-/// Douglas-Peucker on the transform track: a keyframe survives only where
-/// dropping it would move the outline further than [tolerance].
-List<Key<Motion>> _reduceMotion(
-    List<int> times, List<Motion> motions, Point pivot, List<Point> reference, double tolerance) {
-  final keep = List<bool>.filled(motions.length, false);
-  keep[0] = keep[motions.length - 1] = true;
-
-  void split(int a, int b) {
-    if (b - a < 2) return;
-    var worst = -1;
-    var error = tolerance;
-    for (var i = a + 1; i < b; i++) {
-      final t = (times[i] - times[a]) / (times[b] - times[a]);
-      final guess = Motion.lerp(motions[a], motions[b], t);
-      var sum = 0.0;
-      for (final p in reference) {
-        final d = (motions[i].apply(pivot, p) - guess.apply(pivot, p)).length;
-        sum += d * d;
-      }
-      // Root mean square, not the worst point: a contour traced from whole
-      // pixels jitters, and chasing that jitter costs keyframes without
-      // looking any closer to the source.
-      final local = math.sqrt(sum / reference.length);
-      if (local > error) {
-        error = local;
-        worst = i;
-      }
-    }
-    if (worst < 0) return;
-    keep[worst] = true;
-    split(a, worst);
-    split(worst, b);
-  }
-
-  split(0, motions.length - 1);
-  return [
-    for (var i = 0; i < motions.length; i++)
-      if (keep[i]) Key(times[i], motions[i]),
-  ];
 }
 
 Motion _motionAt(List<Key<Motion>> keys, int timeMs) {
@@ -648,67 +624,6 @@ Motion _motionAt(List<Key<Motion>> keys, int timeMs) {
     }
   }
   return keys.last.value;
-}
-
-/// Keyframes for the path data, judged by the error they leave on screen -
-/// residual and transform composed - rather than in the group's own space.
-List<Key<List<Curve>>> _reduceShapes(
-    List<int> times,
-    List<List<List<Point>>> residuals,
-    List<List<Curve>> world,
-    List<bool> visible,
-    List<Key<Motion>> motion,
-    Point pivot,
-    Options options) {
-  final keep = List<bool>.filled(residuals.length, false);
-  final flat = [for (final frame in residuals) frame.expand((c) => c).toList()];
-  final target = [for (final frame in world) frame.expand((c) => c).toList()];
-
-  double deviation(int frame, List<Point> guess) {
-    final transform = _motionAt(motion, times[frame]);
-    var sum = 0.0;
-    for (var k = 0; k < guess.length; k++) {
-      final d = (transform.apply(pivot, guess[k]) - target[frame][k]).length;
-      sum += d * d;
-    }
-    return math.sqrt(sum / guess.length);
-  }
-
-  // A shape the transform already explains needs no path animation at all.
-  final model = flat[visible.indexOf(true)];
-  var constant = true;
-  for (var f = 0; f < residuals.length && constant; f++) {
-    if (visible[f] && deviation(f, model) > options.rigidTolerance) constant = false;
-  }
-  if (constant) return [Key(times[0], residuals[visible.indexOf(true)])];
-
-  keep[0] = keep[residuals.length - 1] = true;
-  void split(int a, int b) {
-    if (b - a < 2) return;
-    var worst = -1;
-    var error = options.keyframeTolerance;
-    for (var i = a + 1; i < b; i++) {
-      final t = (times[i] - times[a]) / (times[b] - times[a]);
-      final guess = [
-        for (var k = 0; k < flat[i].length; k++) flat[a][k] + (flat[b][k] - flat[a][k]) * t,
-      ];
-      final local = visible[i] ? deviation(i, guess) : 0.0;
-      if (local > error) {
-        error = local;
-        worst = i;
-      }
-    }
-    if (worst < 0) return;
-    keep[worst] = true;
-    split(a, worst);
-    split(worst, b);
-  }
-
-  split(0, residuals.length - 1);
-  return [
-    for (var i = 0; i < residuals.length; i++)
-      if (keep[i]) Key(times[i], residuals[i]),
-  ];
 }
 
 /// Fewest segments whose fit stays inside [tolerance] on every frame, never

@@ -7,6 +7,7 @@ import 'contour.dart';
 import 'fit.dart';
 import 'model.dart';
 import 'raster.dart';
+import 'trim.dart';
 
 /// Frame-by-frame agreement between the generated resources and the GIF.
 class Report {
@@ -168,18 +169,9 @@ Report verify(
   var radius = 0.0;
   for (var f = 0; f < times.length; f++) {
     final paths = playback.at(times[f], durationMs);
-    for (final path in paths) {
-      for (final loop in path.loops) {
-        for (final p in loop) {
-          final d =
-              (Point(p.x * scale + offset.x, p.y * scale + offset.y) - playback.centre).length;
-          if (d > radius) radius = d;
-        }
-      }
-    }
     final mask = Uint8List(width * height);
     for (final path in paths) {
-      final painted = rasterise(path.loops, width, height);
+      final painted = rasterise(path.painted, width, height);
       for (final clip in path.clips) {
         // A clip has no fillType on Android; it fills by winding, and the
         // verifier has to answer as the platform does or a clip that the
@@ -192,6 +184,16 @@ Report verify(
       for (var i = 0; i < mask.length; i++) {
         if (painted[i] != 0) mask[i] = 1;
       }
+    }
+    // How far the artwork reaches is measured from what is actually painted,
+    // after every clip: geometry a clip removes is never on screen, so it can
+    // never be what the platform crops.
+    for (var i = 0; i < mask.length; i++) {
+      if (mask[i] == 0) continue;
+      final x = (i % width + 0.5) * scale + offset.x;
+      final y = (i ~/ width + 0.5) * scale + offset.y;
+      final d = (Point(x, y) - playback.centre).length;
+      if (d > radius) radius = d;
     }
     exact.add(iou(mask, masks[f]));
     tolerant.add(tolerantIou(mask, masks[f], width, height));
@@ -219,21 +221,45 @@ void _walk(
       : parent;
 
   if (node.name.local == 'path') {
-    // Only what is actually filled counts: a path with no fill colour is
-    // stroke-only, and one faded to nothing draws nothing.
+    // A fill and a stroke are both paint: what is on screen is one, the other,
+    // or both, and what has faded to nothing is neither.
+    final paint = paintAnimator ?? animator;
+    double property(String name, double fallback) =>
+        (paint == null ? null : _track(paint, name, fraction, playback)) ??
+        double.parse(_attr(node, name) ?? '$fallback');
     final filled = _attr(node, 'fillColor') != null ||
         node.childElements.any((child) =>
             child.name.local == 'attr' && child.getAttribute('name') == 'android:fillColor');
-    if (!filled) return;
-    final paint = paintAnimator ?? animator;
-    final alpha = (paint == null ? null : _track(paint, 'fillAlpha', fraction, playback)) ??
-        double.parse(_attr(node, 'fillAlpha') ?? '1');
-    if (alpha < 0.5) return;
+    final fills = filled && property('fillAlpha', 1) >= 0.5;
+    final width = _attr(node, 'strokeColor') == null ? 0.0 : property('strokeWidth', 0);
+    final strokes = width > 0 && property('strokeAlpha', 1) >= 0.5;
+    if (!fills && !strokes) return;
     var data = _attr(node, 'pathData')!;
     if (animator != null) data = _morph(animator, timeMs, playback) ?? data;
-    out.add(Drawn([
-      for (final curve in _parse(data)) [for (final p in flatten(curve)) _apply(local, p)],
-    ], clips));
+    final curves = _parse(data);
+    final start = property('trimPathStart', 0), end = property('trimPathEnd', 1);
+    // Read the way the platform reads it, not the way the source meant it:
+    // this is what the device draws, and the gap between the two is the whole
+    // point of checking.
+    final closed = start == 0 && end == 1;
+    final trimmed = strokes && !closed
+        ? trimAndroid(curves, start, end, property('trimPathOffset', 0))
+        : curves;
+    // A `<group>` scale scales the stroke with the geometry, exactly as the
+    // renderer does.
+    final scale = math.sqrt((local[0] * local[4] - local[1] * local[3]).abs());
+    out.add(Drawn(
+      [
+        for (final curve in curves) [for (final p in flatten(curve)) _apply(local, p)],
+      ],
+      clips,
+      fills: fills,
+      stroke: strokes ? width * scale : 0,
+      stroked: [
+        for (final curve in trimmed) [for (final p in flatten(curve)) _apply(local, p)],
+      ],
+      strokeClosed: closed,
+    ));
     return;
   }
   // A clip-path narrows everything inside its group.
@@ -302,7 +328,7 @@ String? _morph(XmlElement animator, int timeMs, Playback playback) {
   if (steps.isEmpty) return null;
   for (final step in steps) {
     final length = int.parse(_attr(step, 'duration')!);
-    if (timeMs <= clock + length || step == steps.last) {
+    if (timeMs < clock + length || step == steps.last) {
       final progress = length <= 0 ? 1.0 : ((timeMs - clock) / length).clamp(0.0, 1.0);
       final t = playback.easing(_attr(step, 'interpolator'))(progress);
       return _lerpData(_attr(step, 'valueFrom')!, _attr(step, 'valueTo')!, t);
