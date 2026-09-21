@@ -188,6 +188,33 @@ void main() {
           reason: 'a dry run writes nothing');
     });
 
+    test('converts an animated SVG the same way', () {
+      final root = _project('test/fixtures/logo.svg');
+      final result = createSplash(SplashConfig.read(root.path), root: root.path);
+      expect(result.generated.drawable.source, 'SVG');
+      expect(result.config.kind, SourceKind.svg);
+      expect(result.report!.meanExact, greaterThan(0.999));
+      expect(
+          File(p.join(root.path, 'android/app/src/main/res/drawable/splash_vector.xml'))
+              .existsSync(),
+          isTrue);
+    });
+
+    test('paints the background the plate the artwork sits on gave it', () {
+      final root = _project('test/fixtures/plate.json');
+      File(p.join(root.path, configFileName))
+          .writeAsStringSync('android_avd_splash:\n  source: assets/plate.json\n');
+      final result = createSplash(SplashConfig.read(root.path), root: root.path);
+      // The platform masks the icon to a circle, so the plate cannot be drawn
+      // behind the artwork - the splash background is where it belongs.
+      expect(result.generated.plate, 0xFF2196F3);
+      expect(result.background, 0xFF2196F3);
+      expect(
+          File(p.join(root.path, 'android/app/src/main/res/values/splash.xml')).readAsStringSync(),
+          contains('#FF2196F3'));
+      expect(result.warnings, isEmpty);
+    });
+
     test('converts a GIF the same way', () {
       final root = _project('test/fixtures/shapes.gif');
       final result = createSplash(SplashConfig.read(root.path), root: root.path);

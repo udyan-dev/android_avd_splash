@@ -8,6 +8,10 @@ import 'build.dart';
 /// Name of the configuration file read from the project root.
 const configFileName = 'android_avd_splash.yaml';
 
+/// What kind of animation the source is, which decides how it is converted:
+/// the two vector forms are rebuilt structurally, a GIF has to be traced.
+enum SourceKind { lottie, svg, gif }
+
 /// Everything `create` needs, as read from [configFileName].
 ///
 /// Every field has a default that satisfies the platform's splash screen
@@ -68,7 +72,7 @@ class SplashConfig {
     }
     final source = yaml['source'];
     if (source is! String || source.isEmpty) {
-      throw ConfigError('`source:` is required - the .json or .gif to convert');
+      throw ConfigError('`source:` is required - the .json, .svg or .gif to convert');
     }
     final name = _string(yaml, 'name') ?? 'splash';
     if (!RegExp(r'^[a-z][a-z0-9_]*$').hasMatch(name)) {
@@ -105,7 +109,7 @@ class SplashConfig {
   static const _section = 'android_avd_splash';
 
   /// The animation to convert, relative to the project root: `.json` for
-  /// Lottie, `.gif` for an animated GIF.
+  /// Lottie, `.svg` for an animated SVG, `.gif` for an animated GIF.
   final String source;
 
   /// Resource name stem: the drawable becomes `@drawable/<name>`.
@@ -113,7 +117,7 @@ class SplashConfig {
 
   /// Splash background, as `0xAARRGGBB`. The platform requires one opaque
   /// colour, which is also what the window shows before API 31. Left out, a
-  /// GIF's own background colour is used and a Lottie animation gets white.
+  /// GIF's own background colour is used and a vector source gets white.
   final int? background;
 
   /// Background under `values-night`. Left out, night uses [background].
@@ -162,8 +166,19 @@ class SplashConfig {
   /// Whether to replay the written XML against the source and report.
   final bool verify;
 
-  /// True when the source is Lottie rather than a GIF.
-  bool get isLottie => p.extension(source).toLowerCase() == '.json';
+  /// What the source is, from its extension.
+  SourceKind get kind => switch (p.extension(source).toLowerCase()) {
+        '.json' => SourceKind.lottie,
+        '.svg' => SourceKind.svg,
+        _ => SourceKind.gif,
+      };
+
+  /// True when the source is a Lottie animation.
+  bool get isLottie => kind == SourceKind.lottie;
+
+  /// True when the source is vector in as well as vector out, and so converts
+  /// exactly rather than being traced.
+  bool get isVector => kind != SourceKind.gif;
 
   /// The safe radius the platform actually allows: two thirds of the canvas,
   /// halved, which is the 192dp circle in a 288dp icon and the 160dp circle in

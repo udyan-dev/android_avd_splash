@@ -41,8 +41,13 @@ Future<void> main(List<String> arguments) async {
       stderr.writeln('create: ${error.message}');
       exitCode = 65;
     }
-  }, (error, _) {
-    if (error is! StdoutException && error is! SocketException) throw error;
+  }, (error, stack) {
+    // A pipe that closes early arrives here, asynchronously, as a write
+    // failure on stdout: `create | head` is not a crash.
+    if (error is StdoutException || error is SocketException || error is FileSystemException) {
+      exit(0);
+    }
+    Error.throwWithStackTrace(error, stack);
   });
 }
 

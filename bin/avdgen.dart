@@ -8,7 +8,7 @@ import 'package:path/path.dart' as p;
 final _parser = ArgParser()
   ..addOption('out', abbr: 'o', help: 'Android res directory to write into.')
   ..addOption('project', help: 'Project root; its res directory is found for you.')
-  ..addOption('name', abbr: 'n', help: 'Resource name stem (default: the GIF file name).')
+  ..addOption('name', abbr: 'n', help: 'Resource name stem (default: the source file name).')
   ..addOption('canvas', defaultsTo: '288', help: 'Drawable size in dp.')
   ..addOption('safe', defaultsTo: '96', help: 'Radius in dp the artwork must stay inside.')
   ..addOption('background', help: 'Background colour override, #AARRGGBB.')
@@ -24,7 +24,7 @@ final _parser = ArgParser()
   ..addOption('min-thickness', defaultsTo: '0.4', help: 'Drop regions thinner than this, in dp.')
   ..addFlag('trim', defaultsTo: true, help: 'Drop blank lead-in and the static tail.')
   ..addFlag('gradients', defaultsTo: true, help: 'Fill a path with a gradient when it needs one.')
-  ..addFlag('verify', defaultsTo: true, help: 'Replay the written XML against the GIF.')
+  ..addFlag('verify', defaultsTo: true, help: 'Replay the written XML against the source.')
   ..addFlag('dry-run', help: 'Report only; write nothing.')
   ..addFlag('help', abbr: 'h', negatable: false);
 
@@ -47,14 +47,19 @@ void _run(List<String> arguments) {
     _fail(e.message);
   }
   if (args['help'] as bool || args.rest.length != 1) {
-    _say('Usage: avdgen <animation.json|animation.gif> [--out <res>|--project <dir>]\n');
+    _say('Usage: avdgen <animation.json|animation.svg|animation.gif> '
+        '[--out <res>|--project <dir>]\n');
     _say(_parser.usage);
     exit(args['help'] as bool ? 0 : 64);
   }
 
   final source = File(args.rest.single);
   if (!source.existsSync()) _fail('no such file: ${source.path}');
-  final isLottie = p.extension(source.path).toLowerCase() == '.json';
+  final kind = switch (p.extension(source.path).toLowerCase()) {
+    '.json' => SourceKind.lottie,
+    '.svg' => SourceKind.svg,
+    _ => SourceKind.gif,
+  };
 
   final options = Options(
     name: _resourceName(args['name'] as String? ?? p.basenameWithoutExtension(source.path)),
@@ -78,8 +83,11 @@ void _run(List<String> arguments) {
   final Generated generated;
   try {
     final bytes = source.readAsBytesSync();
-    generated =
-        isLottie ? convertLottie(bytes, options: options) : generate(bytes, options: options);
+    generated = switch (kind) {
+      SourceKind.lottie => convertLottie(bytes, options: options),
+      SourceKind.svg => convertSvg(bytes, options: options),
+      SourceKind.gif => generate(bytes, options: options),
+    };
   } on FormatException catch (e) {
     _fail('${source.path}: ${e.message}');
   } on StateError catch (e) {
@@ -91,7 +99,7 @@ void _run(List<String> arguments) {
     _say('${p.basename(source.path)}: ${avd.gif.width}x${avd.gif.height}, '
         '${avd.gif.frames.length} frames, ${avd.gif.durationMs} ms');
   } else {
-    _say('${p.basename(source.path)}: Lottie, ${drawable.durationMs} ms');
+    _say('${p.basename(source.path)}: ${drawable.source}, ${drawable.durationMs} ms');
   }
   _say('${options.name}: ${drawable.durationMs} ms, '
       '${avd == null ? '' : '${avd.frameTimes.length} source frames, '}'
@@ -100,13 +108,20 @@ void _run(List<String> arguments) {
       '${drawable.paths.where((s) => s.paint.gradient != null).isEmpty ? '' : ', '
           '${drawable.paths.where((s) => s.paint.gradient != null).length} with gradients'}), '
       '${(generated.bytes / 1024).toStringAsFixed(1)} KiB');
+  final plate = generated.plate;
+  if (plate != null) {
+    _say('background: the artwork sits on a plate of '
+        '#${(plate & 0xFFFFFFFF).toRadixString(16).toUpperCase().padLeft(8, '0')}, '
+        'dropped - the platform masks the icon to a circle, so a plate belongs to '
+        'the splash background');
+  }
   if (generated.unsupported.isNotEmpty) {
     _say('not converted: ${generated.unsupported.join(', ')}');
     exitCode = 1;
   }
 
   if (args['verify'] as bool) {
-    final report = avd == null ? checkLottie(generated) : check(generated);
+    final report = avd == null ? checkVector(generated) : check(generated);
     _say('edge: mean ${report.meanDeviationDp.toStringAsFixed(3)}dp off the source outline, '
         '95% within ${report.typicalDeviationDp.toStringAsFixed(2)}dp, '
         'worst ${report.worstDeviationDp.toStringAsFixed(2)}dp');

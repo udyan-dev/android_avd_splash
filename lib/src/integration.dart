@@ -165,7 +165,6 @@ package $package
 import android.app.Activity
 import android.graphics.drawable.AnimatedVectorDrawable
 import android.os.Build
-import android.os.SystemClock
 import android.view.Gravity
 import android.view.ViewGroup
 import android.widget.FrameLayout
@@ -177,32 +176,28 @@ import android.widget.ImageView
  * this file, so keep your own code in the activity.
  */
 internal object AvdSplash {
-    /**
-     * Length of `@drawable/${config.name}`. The platform caps the duration it
-     * reports back through `SplashScreenView`, so the animation's own length is
-     * the only reliable one.
-     */
+    /** Length of `@drawable/${config.name}`, which is how long the icon plays. */
     private const val DURATION_MS = ${durationMs}L
 
     fun install(activity: Activity) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            // Android 12 and up draw the splash screen themselves, then dismiss
-            // it as soon as the app draws its first frame - usually before the
-            // icon has finished. Holding the view is the documented way to let
-            // the animation play out, and it must end with remove().
-            val shown = SystemClock.uptimeMillis()
             activity.splashScreen.setOnExitAnimationListener { view ->
-                val left = DURATION_MS - (SystemClock.uptimeMillis() - shown)
-                if (left > 0L) view.postDelayed({ view.remove() }, left) else view.remove()
+                // The platform caps the length it reports here, so the icon
+                // would be taken away mid-animation if it were believed. The
+                // drawable's own length is the one that is true.
+                val started = view.iconAnimationStart?.toEpochMilli()
+                val elapsed = if (started == null) 0L else
+                    (System.currentTimeMillis() - started).coerceAtLeast(0L)
+                val remaining = (DURATION_MS - elapsed).coerceAtLeast(0L)
+                if (remaining == 0L) view.remove() else view.postDelayed({ view.remove() }, remaining)
             }
         } else {
             overlay(activity)
         }
     }
 
-    // Below Android 12 there is no platform splash screen. The launch theme has
-    // already painted the background, so playing the same drawable over it gives
-    // every version the same animation.
+    // The launch theme has already painted the background, so playing the same
+    // drawable over it gives every Android version the same animation.
     private fun overlay(activity: Activity) {
         val size = activity.resources.getDimensionPixelSize(R.dimen.${config.name}_icon_size)
         val icon = ImageView(activity)
@@ -236,7 +231,6 @@ package $package;
 import android.app.Activity;
 import android.graphics.drawable.AnimatedVectorDrawable;
 import android.os.Build;
-import android.os.SystemClock;
 import android.view.Gravity;
 import android.view.ViewGroup;
 import android.widget.FrameLayout;
@@ -251,37 +245,36 @@ import android.window.SplashScreenView;
  */
 final class AvdSplash {
 
-    /**
-     * Length of `@drawable/${config.name}`. The platform caps the duration it
-     * reports back through `SplashScreenView`, so the animation's own length is
-     * the only reliable one.
-     */
+    /** Length of `@drawable/${config.name}`, which is how long the icon plays. */
     private static final long DURATION_MS = ${durationMs}L;
 
     private AvdSplash() {}
 
     static void install(final Activity activity) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            // Android 12 and up draw the splash screen themselves, then dismiss
-            // it as soon as the app draws its first frame - usually before the
-            // icon has finished. Holding the view is the documented way to let
-            // the animation play out, and it must end with remove().
-            final long shown = SystemClock.uptimeMillis();
             activity.getSplashScreen().setOnExitAnimationListener(
                     new SplashScreen.OnExitAnimationListener() {
                         @Override
                         public void onSplashScreenExit(final SplashScreenView view) {
-                            final long left = DURATION_MS - (SystemClock.uptimeMillis() - shown);
-                            if (left <= 0L) {
+                            // The platform caps the length it reports here, so
+                            // the icon would be taken away mid-animation if it
+                            // were believed. The drawable's own length is the
+                            // one that is true.
+                            final long started = view.getIconAnimationStart() == null
+                                    ? System.currentTimeMillis()
+                                    : view.getIconAnimationStart().toEpochMilli();
+                            final long elapsed = Math.max(0L, System.currentTimeMillis() - started);
+                            final long remaining = Math.max(0L, DURATION_MS - elapsed);
+                            if (remaining == 0L) {
                                 view.remove();
-                                return;
+                            } else {
+                                view.postDelayed(new Runnable() {
+                                    @Override
+                                    public void run() {
+                                        view.remove();
+                                    }
+                                }, remaining);
                             }
-                            view.postDelayed(new Runnable() {
-                                @Override
-                                public void run() {
-                                    view.remove();
-                                }
-                            }, left);
                         }
                     });
         } else {
@@ -289,9 +282,8 @@ final class AvdSplash {
         }
     }
 
-    // Below Android 12 there is no platform splash screen. The launch theme has
-    // already painted the background, so playing the same drawable over it gives
-    // every version the same animation.
+    // The launch theme has already painted the background, so playing the same
+    // drawable over it gives every Android version the same animation.
     private static void overlay(final Activity activity) {
         final int size =
                 activity.getResources().getDimensionPixelSize(R.dimen.${config.name}_icon_size);

@@ -1,9 +1,26 @@
 # android_avd_splash
 
-Turns a Lottie animation or an animated GIF into an Android 12+ splash screen:
-an `AnimatedVectorDrawable`, every resource the platform needs around it, and
-the two edits that connect them to your launcher activity. One configuration
-file, one command.
+Turns a Lottie animation, an animated SVG or an animated GIF into an Android
+12+ splash screen: an `AnimatedVectorDrawable`, every resource the platform
+needs around it, and the two edits that connect them to your launcher
+activity. One configuration file, one command.
+
+Recorded from release builds at the device's own 1440x2960. Each one starts on
+the home screen, shows the tap and the launch transition, plays the drawable
+for the source's full length, and ends after the app takes over. The time in
+brackets is the animation's own, not the recording's:
+
+### Lottie — 3.97s
+
+[![Lottie demo](doc/demo_lottie.gif)](https://github.com/user-attachments/assets/05937505-c7cd-403c-9101-80b949de17e3)
+
+### Animated SVG — 4.57s
+
+[![Animated SVG demo](doc/demo_svg.gif)](https://github.com/user-attachments/assets/812cdd4d-e3b8-4144-b521-b3b98ada72d0)
+
+### Animated GIF — 2.03s
+
+[![Animated GIF demo](doc/demo_gif.gif)](https://github.com/user-attachments/assets/0a9d990e-1b2b-4bef-be92-5eb1cdec6766)
 
 ```sh
 dart pub add dev:android_avd_splash
@@ -45,12 +62,40 @@ flash the splash screen API exists to remove.
 Lottie is vector in, vector out, so the conversion is structural and exact:
 paths stay the author's Beziers, groups stay `<group>` transforms with the
 author's anchor as the pivot, keyframe easing becomes `<pathInterpolator>`, and
-opacity becomes `fillAlpha`. Three Lottie features have no Android equivalent
-and are converted rather than declared: an alpha track matte becomes a
-`<clip-path>` with the matte wound out of a box around the layer; a trim on a
-*filled* shape is cut into the geometry with de Casteljau, because Android trims
-only strokes; and group opacity is folded into the paints below it, because a
-`<group>` cannot carry any.
+opacity becomes `fillAlpha`. What has no Android equivalent is converted rather
+than declared:
+
+- A plate the artwork sits on becomes the splash background. The platform
+  masks the icon to a circle, so a square behind the artwork can only ever be
+  drawn with its corners cut - and it would spend the whole icon on colour, at
+  the artwork's expense.
+- A primitive that animates - a rectangle's size, an ellipse's centre, a
+  corner radius - animates. So does the trim on a stroke, cut along the path by
+  arc length, and a motion path, walked four times per source frame and thinned
+  back to a quarter of a dp.
+- An alpha track matte becomes a `<clip-path>` with the matte wound out of a
+  box around the layer. A matte is composed the way it is drawn - a whole
+  precomposition, with layers appearing and vanishing and carrying mattes of
+  their own, and a stroke's own half-width counted as coverage - and the result
+  is wound, because a clip has no fill rule to declare one with.
+- A mask that keeps a layer *out* of a shape becomes the same thing: a box with
+  the shape wound out of it.
+- Added masks form one clip union and subtracted masks form a second union
+  punched out of it. Nesting those clips reproduces their intersection with
+  the layer without flattening or tracing the vector geometry.
+- SMIL is read the same way. `<animateTransform>` becomes the `<group>` it
+  drives, `keySplines` becomes a `<pathInterpolator>`, `keyTimes` becomes the
+  keyframe fractions, an `<animate>` on `d` becomes a path morph, and a
+  `<clipPath>` becomes a wound `<clip-path>`. A run that repeats for ever is
+  laid out once, because a splash screen plays once.
+- A curved motion path is walked. `to` and `ti` bend the path a position
+  travels along, and Lottie reads it by arc length, so the curve is sampled per
+  source frame and thinned back to what a person could see - Android only moves
+  in a straight line between keys.
+- A trim on a *filled* shape is cut into the geometry with de Casteljau,
+  because Android trims only strokes.
+- Group opacity is folded into the paints below it, because a `<group>` cannot
+  carry any.
 
 A GIF has to be traced, and strict pixel agreement with one has a ceiling below
 1.0 - a GIF edge owns whole pixels, a vector edge cuts through them. So the run
@@ -59,15 +104,66 @@ reports the share of it reached. Chase the percentage, not the raw number.
 
 | Source | Accuracy | Paths | Size | Morph load |
 | --- | --- | --- | --- | --- |
-| Lottie, track mattes | 100.0% of 1.0000 | 2 | 65 KiB | 26 |
-| Lottie, gradients and trim | 100.0% of 1.0000 | 8 | 182 KiB | 34 |
-| GIF, flat colour | 100.0% of 1.0000 | 11 | 499 KiB | 293 |
-| GIF, photographic | 97.6% of 0.9902 | 22 | 1.8 MiB | 400 |
+| Lottie, nested precomps and track mattes | 100.0% of 1.0000 | 40 | 541 KiB | 0 |
+| Lottie, stroked arcs and trims | 100.0% of 1.0000 | 13 | 83 KiB | 8 |
+| Lottie, gradients and trim | 100.0% of 1.0000 | 8 | 162 KiB | 34 |
+| Lottie, track mattes | 100.0% of 1.0000 | 2 | 72 KiB | 26 |
+| SVG, SMIL transforms | 100.0% of 1.0000 | 10 | 80 KiB | 0 |
+| GIF, flat colour | 99.5% of 0.9987 | 7 | 778 KiB | 264 |
+| GIF, photographic | 97.7% of 0.9902 | 22 | 5.2 MiB | 400 |
+
+The numbers above are this package checking itself, which is worth exactly as
+much as the checker knowing what the platform does. So each release is also
+measured two ways it cannot fool: against the renderer the format came from -
+lottie-web for Lottie, a browser for SMIL, the decoded frames for a GIF - and
+against a real device, which plays the drawable beside a strip encoding its own
+elapsed milliseconds so a recorded frame can be lined up with the millisecond
+the model says it is. A keyframe that arrives at the wrong time is then a
+number rather than an impression.
 
 Every run replays the XML it wrote - parsing it back, evaluating the animators
 and the interpolators, rasterising the result - and reports the overlap, the
 outline deviation in dp, and how far the artwork reaches. The measurement is
 taken from the written files, not from the model that produced them.
+
+## What the platform does to an animation you did not ask for
+
+`AnimatorInflater` and `KeyframeSet` are quiet about all of this. A drawable
+that breaks any of these rules still inflates, still runs, and still verifies
+against anything that reads the file the way it was written rather than the way
+Android reads it.
+
+- An `<objectAnimator>` with no `android:interpolator` is
+  accelerate-decelerate, and that curve is applied to the whole track before a
+  keyframe is consulted. Every animator written here names the linear
+  interpolator, so the only easing in the file is the author's own.
+- Two keyframes at one fraction are not a step. `KeyframeSet` divides by the
+  gap between the keyframes around a fraction. A step - a layer appearing, a
+  GIF frame changing - is written as a change one millisecond wide instead,
+  which is under a rendered frame at any length a splash screen has.
+- `pathData` keyframes inside a `<propertyValuesHolder>` are ignored, and
+  `android:valueFrom` cannot be left off a `pathData` animator. A morph is a
+  `<set android:ordering="sequentially">` of one two-value `<objectAnimator>`
+  per step.
+- A track that stops short keeps drifting: the native animator extrapolates
+  past its outermost keyframes instead of holding them. Every track carries a
+  keyframe at 0 and at 1 - and where the timeline cuts an interval short, the
+  cubic easing of that interval is split at the cut rather than reused whole.
+- A `<clip-path>` has no fill type. `VectorDrawableClipPath` reads `name` and
+  `pathData` and nothing else, so a clip always fills by winding and a hole in
+  one has to be wound against the loop around it.
+- `SplashScreenView.getIconAnimationDuration()` is capped by the platform, so
+  the handover holds the screen for the drawable's own length instead.
+- A compiled resource string is fifteen bits long. A longer `<path>` comes back
+  broken at runtime and the splash screen answers by silently showing the
+  launcher icon.
+- A trim whose start has run past its end is a window across the seam, and the
+  platform draws the rest of the outline. Lottie draws the arc between the
+  lower and the higher of the two, so the pair is written in order, with the
+  offset folded in where the two cross.
+- `z` closes a contour whatever its geometry says, so an open one is drawn with
+  a chord across it and a miter join at the seam. Only a contour that returns
+  to its start is closed here.
 
 ## Guidelines it enforces
 
@@ -79,9 +175,20 @@ taken from the written files, not from the model that produced them.
   merge. Night is a colour resource, so it needs no version qualifier of its
   own - and a missing `values-night-v31` is exactly how an API 31 device in dark
   mode loses its animated icon.
+- No `<path>` is written longer than an Android resource string can hold.
+  `aapt2` stores a compiled XML's strings with a fifteen-bit length, so a
+  longer one comes back broken, the drawable fails to inflate, and the splash
+  screen answers by silently showing the launcher icon. Paths that would
+  overrun it are split across `<path>` elements, keeping each outline with the
+  outlines nested inside it, so the drawing is unchanged.
 - An animation longer than 1000ms is reported, because the guidelines ask for
   one second or less on phones. `duration_ms:` replays it faster; every keyframe
   moves by one factor, so the motion is unchanged.
+- On API 31 and 32 the platform shows the animated icon only when the app is
+  launched from the launcher; every other entry point gets the background
+  alone. `icon_preferred` asks for the icon everywhere, and Android 13 is
+  where that attribute starts working - which is why it is written into
+  `values-v33/`.
 - No splash `Activity` is generated. Android 12 and up hand the screen over
   through `setOnExitAnimationListener`, held for the drawable's own length
   because the platform caps the duration it reports. Below API 31, where there
@@ -94,7 +201,7 @@ taken from the written files, not from the model that produced them.
 
 | Option | Default | What it does |
 | --- | --- | --- |
-| `source` | - | `.json` Lottie or `.gif`, relative to the project root |
+| `source` | - | `.json` Lottie, `.svg` or `.gif`, relative to the project root |
 | `name` | `splash` | resource stem: `@drawable/splash`, `@style/Theme.Splash` |
 | `background` | GIF's own, else white | one opaque colour, `#RRGGBB` or `#AARRGGBB` |
 | `background_night` | - | the same under `values-night` |
@@ -109,7 +216,7 @@ taken from the written files, not from the model that produced them.
 | `patch_activity` | `true` | write the handover call into the activity |
 | `verify` | `true` | replay the written XML and report |
 | `gradients` | `true` | fill a region with a gradient when it needs one |
-| `trim` | `true` | drop a blank lead-in and a static tail |
+| `trim` | `true` | drop time at either end where nothing is drawn, and a GIF's static tail |
 | `smooth` | measured | GIF only: blur in source pixels before tracing |
 | `colors` | the GIF's own | GIF only: paint colours, front to back |
 
@@ -143,6 +250,7 @@ this one no longer needs are deleted rather than left to ship in the APK.
 
 ```sh
 dart run android_avd_splash:avdgen logo.json --out path/to/res
+dart run android_avd_splash:avdgen logo.svg --out path/to/res
 dart run android_avd_splash:avdgen logo.gif --dry-run
 ```
 
@@ -157,14 +265,24 @@ import 'package:android_avd_splash/android_avd_splash.dart';
 final result = createSplash(SplashConfig.read('.'));
 print(result.report?.ofCeiling);
 
-final drawable = convertLottie(File('logo.json').readAsBytesSync());
+final drawable = convertSvg(File('logo.svg').readAsBytesSync());
 print(drawable.files['drawable/splash.xml']);
 ```
 
 ## Limits
 
-- Lottie repeaters, merge paths, star shapes, luma mattes, masks, text, image
-  and solid layers are reported, not silently dropped.
+- An SVG is read for its own animation: SMIL. CSS `@keyframes`, `<style>`
+  rules and class selectors, `<mask>`, `<filter>`, `<pattern>`, `<text>` and
+  `<image>` are reported, not silently dropped - and so is a skew, because a
+  `<group>` has no shear and no pair of scales and rotations makes one.
+- A colour that animates is reported. `AnimatedVectorDrawable` can animate
+  one, but a path here carries a single paint, so a file that recolours itself
+  would otherwise show the first colour as if it never changed.
+- Lottie repeaters, merge paths, star shapes, luma mattes, text, image and
+  solid layers are reported, not silently dropped.
+- A mask on a layer that is itself being used as a matte is reported. Its
+  coverage requires intersecting two independently animated regions while
+  flattening the whole result into the single clip path Android accepts.
 - `AnimatedVectorDrawable` cannot animate a gradient, so a gradient is fitted
   once, from the frame that shows its region most fully.
 - A `<clip-path>` is not anti-aliased and has no fill type, so a matte edge is

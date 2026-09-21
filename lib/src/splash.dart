@@ -66,21 +66,27 @@ SplashResult createSplash(SplashConfig config, {String root = '.', bool dryRun =
   final project = AndroidProject.find(root, config.androidDir);
   final source = File(p.join(root, config.source));
   if (!source.existsSync()) throw ConfigError('no ${source.path} - check `source:`');
-  if (!config.isLottie && p.extension(config.source).toLowerCase() != '.gif') {
-    throw ConfigError('${config.source} is neither a .json Lottie nor a .gif');
+  if (config.kind == SourceKind.gif && p.extension(config.source).toLowerCase() != '.gif') {
+    throw ConfigError('${config.source} is not a .json Lottie, a .svg or a .gif');
   }
 
   final bytes = source.readAsBytesSync();
   final options = config.toOptions();
-  final generated =
-      config.isLottie ? convertLottie(bytes, options: options) : generate(bytes, options: options);
+  final generated = switch (config.kind) {
+    SourceKind.lottie => convertLottie(bytes, options: options),
+    SourceKind.svg => convertSvg(bytes, options: options),
+    SourceKind.gif => generate(bytes, options: options),
+  };
   final report = !config.verify
       ? null
-      : config.isLottie
-          ? checkLottie(generated)
+      : config.isVector
+          ? checkVector(generated)
           : check(generated);
 
-  final background = config.background ?? generated.avd?.separation.background ?? 0xFFFFFFFF;
+  // A plate the artwork was drawn on is the background the author chose, and
+  // the platform can only draw it as the background, so that is where it goes.
+  final background =
+      config.background ?? generated.plate ?? generated.avd?.separation.background ?? 0xFFFFFFFF;
   final theme = splashTheme(config.name);
   final files = {
     ...generated.files,
@@ -213,6 +219,12 @@ List<String> _warnings(SplashConfig config, Generated generated, Report? report)
   }
   if (generated.unsupported.isNotEmpty) {
     warnings.add('not converted: ${generated.unsupported.join(', ')}');
+  }
+  final plate = generated.plate;
+  if (plate != null && config.background != null && config.background != plate) {
+    warnings.add('the artwork sits on a ${hex(plate)} plate, which the platform cannot draw '
+        'behind the icon - it masks the icon to a circle; `background: ${hex(plate)}` or '
+        '`icon_background: ${hex(plate)}` puts that colour back');
   }
   return warnings;
 }

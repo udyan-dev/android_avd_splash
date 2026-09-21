@@ -5,6 +5,7 @@ import 'dart:typed_data';
 import 'contour.dart';
 import 'fit.dart';
 import 'model.dart';
+import 'place.dart';
 import 'trim.dart';
 import 'winding.dart';
 
@@ -61,7 +62,7 @@ class Lottie {
   /// Converts to the drawable model, laid out on a [canvasDp] canvas with the
   /// artwork inside [safeRadiusDp] of its centre.
   Drawable toDrawable(String name, double canvasDp, double safeRadiusDp,
-      {double toleranceDp = 0.15}) {
+      {double toleranceDp = 0.15, bool trim = true}) {
     final unsupported = <String>{};
     final roots = <Group>[];
     var index = 0;
@@ -76,53 +77,22 @@ class Lottie {
           '${unsupported.isEmpty ? '' : ': it uses ${unsupported.join(', ')}'}');
     }
 
-    // Fit the artwork the same way the GIF path does: measure what the
-    // animation ever covers, then place it inside the icon safe area.
-    final draft = Drawable(name, canvasDp, durationMs, roots, source: 'Lottie');
-    final samples = [
-      for (var f = inPoint; f <= outPoint; f += 1) ((f - inPoint) / frameRate * 1000).round(),
-    ];
-    var minX = double.infinity, minY = double.infinity;
-    var maxX = -double.infinity, maxY = -double.infinity;
-    for (final t in samples) {
-      for (final path in draft.at(t, fillsOnly: false)) {
-        for (final loop in path.loops) {
-          for (final p in loop) {
-            minX = math.min(minX, p.x);
-            minY = math.min(minY, p.y);
-            maxX = math.max(maxX, p.x);
-            maxY = math.max(maxY, p.y);
-          }
-        }
-      }
-    }
-    if (!minX.isFinite) throw StateError('the Lottie file draws nothing');
-    final centre = Point((minX + maxX) / 2, (minY + maxY) / 2);
-    var radius = 1e-9;
-    for (final t in samples) {
-      for (final path in draft.at(t, fillsOnly: false)) {
-        for (final loop in path.loops) {
-          for (final p in loop) {
-            radius = math.max(radius, (p - centre).length);
-          }
-        }
-      }
-    }
-    final scale = (safeRadiusDp - 0.05) / radius;
-    // Baked geometry is thinned here, where one unit of the source is a known
-    // number of dp: a keyframe is worth keeping only if a person could see it.
-    final thinned = [for (final group in roots) _thinGroup(group, toleranceDp / scale)];
-    final placement = Group(
-      '${name}_root',
-      pivot: centre,
-      translateX: Track.constant(canvasDp / 2 - centre.x),
-      translateY: Track.constant(canvasDp / 2 - centre.y),
-      scaleX: Track.constant(scale),
-      scaleY: Track.constant(scale),
-      groups: thinned,
-    );
     _unsupported = unsupported;
-    return Drawable(name, canvasDp, durationMs, [placement], source: 'Lottie');
+    return place(
+      name: name,
+      source: 'Lottie',
+      roots: roots,
+      width: width,
+      height: height,
+      durationMs: durationMs,
+      samples: [
+        for (var f = inPoint; f <= outPoint; f += 1) ((f - inPoint) / frameRate * 1000).round(),
+      ],
+      canvasDp: canvasDp,
+      safeRadiusDp: safeRadiusDp,
+      toleranceDp: toleranceDp,
+      trim: trim,
+    );
   }
 
   /// Features found in the file that this converter does not reproduce.
@@ -137,9 +107,27 @@ class Lottie {
     for (var i = source.length - 1; i >= 0; i--) {
       final layer = source[i];
       if (layer['hd'] == true || layer['td'] == 1) continue; // a matte is not drawn
-      if (layer['hasMask'] == true) unsupported.add('masks');
       var group = _layer(layer, byIndex, source, unsupported, id);
       if (group == null) continue;
+
+      // Added masks form one union that clips the layer; subtracted masks form
+      // another union punched out of it. Nesting the two clips expresses the
+      // intersection exactly without flattening either operation.
+      final masks = _masks(layer, byIndex, unsupported, id);
+      if (masks.added.parts.isNotEmpty) {
+        group = Group(
+          id('mask'),
+          clip: _clip(masks.added, group, inverted: false),
+          groups: [group],
+        );
+      }
+      if (masks.subtracted.parts.isNotEmpty) {
+        group = Group(
+          id('mask'),
+          clip: _clip(masks.subtracted, group, inverted: true),
+          groups: [group],
+        );
+      }
 
       // A track matte draws this layer only where the layer above it is, or
       // only where it is not; a `<clip-path>` holding that shape - or the whole
@@ -150,8 +138,9 @@ class Lottie {
         if (matte == null || matte['td'] != 1) {
           unsupported.add('track mattes');
         } else if (matteType == 1 || matteType == 2) {
+          final region = _matteOf(matte, byIndex, source, unsupported, id);
           group = Group(id('matte'),
-              clip: _clip(matte, byIndex, group, inverted: matteType == 2), groups: [group]);
+              clip: _clip(region, group, inverted: matteType == 2), groups: [group]);
         } else {
           unsupported.add('luma mattes');
         }
@@ -165,7 +154,7 @@ class Lottie {
   Group? _layer(Map<String, dynamic> layer, Map<Object?, Map<String, dynamic>> byIndex,
       List<Map<String, dynamic>> source, Set<String> unsupported, String Function(String) id) {
     final type = layer['ty'];
-    final List<Group> children;
+    late List<Group> children;
     if (type == 4) {
       children = _shapes(
         [for (final s in (layer['shapes'] as List? ?? const [])) s as Map<String, dynamic>],
@@ -176,6 +165,10 @@ class Lottie {
       );
     } else if (type == 0 && assets[layer['refId'].toString()] != null) {
       children = _composition(assets[layer['refId'].toString()]!, unsupported, id);
+      final stretch = ((layer['sr'] as num?) ?? 1).toDouble();
+      final start = ((layer['st'] as num?) ?? 0).toDouble();
+      final shiftMs = ((start + inPoint * (stretch - 1)) / frameRate * 1000).round();
+      children = [for (final child in children) child.mapped(stretch, shiftMs)];
     } else {
       unsupported.add(switch (type) {
         1 => 'solid layers',
@@ -195,6 +188,12 @@ class Lottie {
       final above = byIndex[parent]!;
       group = _transform(above['ks'] as Map<String, dynamic>?, id('parent'), [group]);
       parent = above['parent'];
+    }
+    if (type == 0) {
+      final window = _window(layer);
+      if (!window.isConstant) {
+        group = Group(id('window'), scaleX: window, scaleY: window, groups: [group]);
+      }
     }
     return group;
   }
@@ -221,36 +220,185 @@ class Lottie {
     return Track(keys);
   }
 
-  /// The clip a matte layer describes, in the space of the layer it mattes:
-  /// the matte's own outline, transformed by its own transform, and for an
-  /// inverted matte punched out of the whole canvas.
-  Track<List<Curve>> _clip(
-      Map<String, dynamic> matte, Map<Object?, Map<String, dynamic>> byIndex, Group clipped,
-      {required bool inverted}) {
-    final unsupported = <String>{};
-    var index = 0;
-    final group = _layer(matte, byIndex, const [], unsupported, (kind) => 'matte${index++}');
+  /// What a matte layer covers, as a plan that can be evaluated at any time.
+  ///
+  /// A matte is not always one shape. It can be a whole precomposition, whose
+  /// layers appear and vanish and can carry mattes of their own, and a
+  /// `<clip-path>` is one path filled by winding. So the plan records what each
+  /// part *adds* and what a matte of its own *removes*, and the clip is written
+  /// by winding those parts against each other: adding turns one way, removing
+  /// turns the other, and non-zero winding cancels them exactly where Lottie
+  /// would have cut the pixels away.
+  _Matte _matteOf(Map<String, dynamic> layer, Map<Object?, Map<String, dynamic>> byIndex,
+      List<Map<String, dynamic>> siblings, Set<String> unsupported, String Function(String) id) {
+    final nested = layer['refId'] == null ? null : assets[layer['refId'].toString()];
+    if (layer['ty'] == 0 && nested != null) {
+      final parts = <_MattePart>[];
+      final inner = {for (final l in nested) l['ind']: l};
+      // The precomposition's own transform sits above everything inside it.
+      final stack = _transformStack(layer, byIndex, unsupported, id);
+      for (var i = nested.length - 1; i >= 0; i--) {
+        final child = nested[i];
+        if (child['hd'] == true || child['td'] == 1) continue;
+        final matteType = child['tt'];
+        final matte = matteType == null || i == 0 ? null : nested[i - 1];
+        if (matteType == 1) unsupported.add('a matte inside a matte');
+        parts.add(_MatteNest(
+          stack,
+          _window(layer),
+          _matteOf(child, inner, nested, unsupported, id),
+          matteType == 2 && matte != null && matte['td'] == 1
+              ? _matteOf(matte, inner, nested, unsupported, id)
+              : null,
+        ));
+      }
+      return _Matte(parts);
+    }
+    final group = _layer(layer, byIndex, siblings, unsupported, id);
+    if (group == null) return const _Matte([]);
+    // What paints is what mattes: a fill covers its interior and a stroke
+    // covers a band around it. A path that does neither still has an outline,
+    // which is the nearest thing to coverage it has.
+    final leaves = <_MatteLeaf>[];
+    void walk(Group node, List<Group> stack) {
+      final here = [...stack, node];
+      final painting = node.paths.where((path) => path.paint.hasFill || path.paint.hasStroke);
+      for (final path in painting.isEmpty ? node.paths.take(1) : painting) {
+        leaves.add(_MatteLeaf(here, path));
+      }
+      for (final child in node.groups) {
+        walk(child, here);
+      }
+    }
+
+    walk(group, const []);
+    // A mask narrows the layer, and here the layer is itself being taken out
+    // of something else. Subtracting a region that reaches outside what it is
+    // subtracted from needs an intersection, and one wound path cannot say
+    // intersection, so this is reported rather than approximated.
+    if (layer['masksProperties'] is List && (layer['masksProperties'] as List).isNotEmpty) {
+      unsupported.add('a mask on a matte');
+    }
+    return _Matte(leaves);
+  }
+
+  /// The regions a layer's masks keep or remove, in the layer's own space.
+  ///
+  /// A mask lives above the shapes and below the layer transform, so it takes
+  /// the layer's transform stack and none of the groups inside it. Only the
+  /// Added masks and subtracted masks are each unions. Applying the added union
+  /// as one clip and the subtracted union as a nested inverse clip reproduces
+  /// their intersection with the layer.
+  ({_Matte added, _Matte subtracted}) _masks(
+      Map<String, dynamic> layer,
+      Map<Object?, Map<String, dynamic>> byIndex,
+      Set<String> unsupported,
+      String Function(String) id) {
+    final masks = layer['masksProperties'];
+    if (masks is! List || masks.isEmpty) {
+      return (added: const _Matte([]), subtracted: const _Matte([]));
+    }
+    final added = <_MattePart>[];
+    final subtracted = <_MattePart>[];
+    var stack = const <Group>[];
+    final window = _window(layer);
+    for (final entry in masks) {
+      final mask = entry as Map<String, dynamic>;
+      final mode = mask['mode'];
+      final inverted = mask['inv'] == true;
+      // 'a' adds the mask to what is shown, 's' subtracts it; inverting one
+      // turns it into the other. 'n' is a mask that is switched off.
+      if (mode == 'n') continue;
+      if (mode != 'a' && mode != 's') {
+        unsupported.add('masks');
+        continue;
+      }
+      final path = mask['pt'];
+      if (path is! Map<String, dynamic>) continue;
+      if ((mask['x'] as Map?)?['k'] is num && ((mask['x'] as Map)['k'] as num) != 0) {
+        unsupported.add('mask expansion');
+      }
+      if (stack.isEmpty) stack = _transformStack(layer, byIndex, unsupported, id);
+      final part = _MatteLeaf(
+        stack,
+        PathItem(
+          id('mask'),
+          _pathTrack(path),
+          Paint(
+            color: 0xFF000000,
+            alpha: multiplyTracks(window, _scalarTrack(mask['o'], 0.01)),
+          ),
+        ),
+      );
+      final subtracts = (mode == 'a' && inverted) || (mode == 's' && !inverted);
+      (subtracts ? subtracted : added).add(part);
+    }
+    return (added: _Matte(added), subtracted: _Matte(subtracted));
+  }
+
+  /// The transform above a layer: its own, then every parent's.
+  List<Group> _transformStack(
+      Map<String, dynamic> layer,
+      Map<Object?, Map<String, dynamic>> byIndex,
+      Set<String> unsupported,
+      String Function(String) id) {
+    final stack = <Group>[_transform(layer['ks'] as Map<String, dynamic>?, id('matte'), const [])];
+    var parent = layer['parent'];
+    final seen = <Object?>{layer['ind']};
+    while (parent != null && byIndex[parent] != null && seen.add(parent)) {
+      final above = byIndex[parent]!;
+      stack.insert(0, _transform(above['ks'] as Map<String, dynamic>?, id('matte'), const []));
+      parent = above['parent'];
+    }
+    return stack;
+  }
+
+  /// The clip a matte describes, in the space of the layer it mattes.
+  ///
+  /// The loops are wound, not declared: `VectorDrawableClipPath` has no
+  /// `fillType`, so a clip always fills by winding, and a hole only exists
+  /// where the geometry turns against the shape around it. An inverted matte
+  /// is the layer's own area with the matte punched out, so it adds a box and
+  /// removes everything the matte covers.
+  Track<List<Curve>> _clip(_Matte region, Group clipped, {required bool inverted}) {
     final frames = [for (var f = inPoint; f <= outPoint; f += 1) _time(f)];
+    final parts = [for (final t in frames) region.at(t)];
+    // Winding is decided once per part, from every frame, because reversing a
+    // loop reverses its path commands: a frame free to disagree would run one
+    // loop backwards in the middle of a morph.
+    final count = parts.isEmpty ? 0 : parts.first.length;
+    final flip = List<bool>.filled(count, false);
+    for (var i = 0; i < count; i++) {
+      var votes = 0;
+      for (final frame in parts) {
+        if (frame.length != count) continue;
+        final part = frame[i];
+        final area = _outerArea(part.loops);
+        if (area == 0) continue;
+        final wanted = (inverted ? -part.sign : part.sign) > 0 ? 1 : -1;
+        votes += area * wanted < 0 ? 1 : -1;
+      }
+      flip[i] = votes > 0;
+    }
     final outlines = [
-      for (final t in frames)
-        if (group == null) const <Curve>[] else [for (final p in outlinesOfGroup(group, t)) ...p],
+      for (final frame in parts)
+        [
+          for (var i = 0; i < frame.length; i++)
+            ...(i < flip.length && flip[i]
+                ? [for (final loop in frame[i].loops) reverseLoop(loop)]
+                : frame[i].loops),
+        ],
     ];
-    // An inverted matte hides what it covers, so the clip is everything else -
-    // and "everything else" only has to reach as far as the layer it clips.
-    // Bounding it there instead of at some multiple of the canvas keeps the
-    // numbers near the artwork, and this path is re-sent on every keyframe.
     final border = inverted ? _border(clipped, frames, outlines) : null;
     final shape = [
       for (var f = 0; f < frames.length; f++)
         [
-          if (border != null) border,
+          if (border != null && border.isNotEmpty) border,
           ...outlines[f],
         ],
     ];
-    // A clip fills by winding, so the punch-out has to be wound, not declared.
-    final winding = Winding.of(shape);
     return Track([
-      for (var f = 0; f < frames.length; f++) Key(frames[f], winding.apply(shape[f])),
+      for (var f = 0; f < frames.length; f++) Key(frames[f], shape[f]),
     ]);
   }
 
@@ -323,7 +471,7 @@ class Lottie {
         items.firstWhere((item) => item['ty'] == 'tr', orElse: () => <String, dynamic>{});
     final groupAlpha = groupTransform['o'] == null
         ? inheritedAlpha
-        : _multiply(inheritedAlpha, _scalarTrack(groupTransform['o'], 0.01));
+        : multiplyTracks(inheritedAlpha, _scalarTrack(groupTransform['o'], 0.01));
 
     for (final item in items.reversed) {
       switch (item['ty']) {
@@ -401,7 +549,7 @@ class Lottie {
     if (gradient && paint['ty'] == 'gs') unsupported.add('gradient strokes');
     // A `<group>` cannot carry opacity, so the opacity of every group above
     // this paint is folded into the paint itself.
-    final alpha = _multiply(inheritedAlpha, _scalarTrack(paint['o'], 0.01));
+    final alpha = multiplyTracks(inheritedAlpha, _scalarTrack(paint['o'], 0.01));
     // Lottie keeps start and end as percentages and the offset in degrees.
     Track<double>? trimTrack(String key) =>
         trim == null ? null : _scalarTrack(trim[key], key == 'o' ? 1 / 360 : 0.01);
@@ -499,11 +647,132 @@ class Lottie {
   /// A `<group>` translates by position minus anchor, which is exactly what a
   /// Lottie transform does once the anchor is used as the pivot.
   Track<double> _offsetTrack(Object? position, Object? separate, double anchor, int axis) {
-    final source = position ?? separate;
-    final track = _scalarTrack(source, 1, axis);
+    final motion = _motion(position);
+    final track = motion != null
+        ? Track([
+            for (final key in motion)
+              Key(key.timeMs, axis == 0 ? key.value.x : key.value.y, key.easing),
+          ])
+        : _scalarTrack(position ?? separate, 1, axis);
     return Track([
       for (final key in track.keys) Key(key.timeMs, key.value - anchor, key.easing),
     ]);
+  }
+
+  /// Position keyframes with their spatial bezier sampled into plain keys, or
+  /// null when the position travels straight and needs none of this.
+  ///
+  /// `to` and `ti` are tangent handles on the path the position travels along,
+  /// and Lottie reads the value at *arc length* down that curve rather than
+  /// between the keyframes. Android animates `translateX` and `translateY`
+  /// separately and in a straight line, so the only way to keep the motion is
+  /// to walk the curve here: one key per source frame, thinned to what a person
+  /// could see. Ignoring the handles is what makes a fly-in drift off its arc
+  /// and its matte slide out from under it.
+  List<Key<Point>>? _motion(Object? property) {
+    if (property is! Map) return null;
+    if (property['s'] == true) return null; // x and y are separate properties
+    final cached = _motions[property];
+    if (cached != null) return cached.isEmpty ? null : cached;
+    final raw = property['k'];
+    final frames = raw is List && raw.isNotEmpty && raw.first is Map
+        ? [for (final frame in raw) frame as Map<String, dynamic>]
+        : const <Map<String, dynamic>>[];
+    final keys = frames.any(_curved) ? _sampleMotion(frames) : const <Key<Point>>[];
+    _motions[property] = keys;
+    return keys.isEmpty ? null : keys;
+  }
+
+  final _motions = <Object, List<Key<Point>>>{};
+
+  /// Whether a position keyframe bends the path it leaves on.
+  bool _curved(Map<String, dynamic> frame) {
+    final to = _vector(frame['to']), ti = _vector(frame['ti']);
+    return (to != null && to.length > 0.01) || (ti != null && ti.length > 0.01);
+  }
+
+  List<Key<Point>> _sampleMotion(List<Map<String, dynamic>> frames) {
+    final keys = <Key<Point>>[];
+    for (var i = 0; i < frames.length; i++) {
+      final frame = frames[i];
+      final start = _vector(frame['s']);
+      if (start == null) continue;
+      final time = _time(frame['t'] as num);
+      final next = i + 1 < frames.length ? frames[i + 1] : null;
+      final end = _vector(frame['e']) ?? (next == null ? null : _vector(next['s']));
+      if (next == null || end == null) {
+        keys.add(Key(time, start));
+        break;
+      }
+      final until = _time(next['t'] as num);
+      final to = _vector(frame['to']), ti = _vector(frame['ti']);
+      if (frame['h'] == 1 || to == null || ti == null || !_curved(frame)) {
+        keys.add(Key(time, start, frame['h'] == 1 ? const Easing(1, 0, 1, 0) : _easing(frame, 0)));
+        continue;
+      }
+      // Four samples per source frame: a frame is not fine enough, because the
+      // easing bends inside one and a fast fly-in can cross a shape's own width
+      // in that time. The thinning below takes back every sample a straight
+      // line already covers, so a gentle arc still costs two keys.
+      final steps = math.max(2, (((next['t'] as num) - (frame['t'] as num)) * 4).round());
+      final arc = _Arc([start, start + to, end + ti, end]);
+      final easing = _easing(frame, 0);
+      final walked = [
+        for (var step = 0; step <= steps; step++)
+          Key(time + ((until - time) * step / steps).round(), arc.at(easing(step / steps))),
+      ];
+      keys.addAll(_thinPoints(walked, _motionTolerance));
+    }
+    return _tidy(keys);
+  }
+
+  /// How far a sample may move the artwork before it has to be kept, in
+  /// composition units.
+  ///
+  /// The artwork ends up fitted to roughly twice the safe radius across, so a
+  /// unit is about `192 / max(width, height)` dp: this is a quarter of a dp,
+  /// which no phone can show, whatever the source was drawn at.
+  double get _motionTolerance => math.max(width, height) / 768;
+
+  /// Douglas-Peucker on a walked motion path: a sample survives only where
+  /// dropping it would move the artwork further than [tolerance].
+  List<Key<Point>> _thinPoints(List<Key<Point>> keys, double tolerance) {
+    if (keys.length < 3) return keys.sublist(0, keys.length - 1);
+    final keep = List<bool>.filled(keys.length, false);
+    keep[0] = keep[keys.length - 1] = true;
+    void split(int a, int b) {
+      if (b - a < 2) return;
+      var worst = -1;
+      var error = tolerance;
+      for (var i = a + 1; i < b; i++) {
+        final span = keys[b].timeMs - keys[a].timeMs;
+        final t = span == 0 ? 0.0 : (keys[i].timeMs - keys[a].timeMs) / span;
+        final guess = keys[a].value + (keys[b].value - keys[a].value) * t;
+        final d = (keys[i].value - guess).length;
+        if (d > error) {
+          error = d;
+          worst = i;
+        }
+      }
+      if (worst < 0) return;
+      keep[worst] = true;
+      split(a, worst);
+      split(worst, b);
+    }
+
+    split(0, keys.length - 1);
+    // The last sample is the next keyframe's own start, so the next span
+    // writes it; writing it here would double it.
+    return [
+      for (var i = 0; i < keys.length - 1; i++)
+        if (keep[i]) keys[i],
+    ];
+  }
+
+  Point? _vector(Object? value) {
+    final raw = value is List ? value : null;
+    if (raw == null || raw.length < 2 || raw.first is! num) return null;
+    return Point((raw[0] as num).toDouble(), (raw[1] as num).toDouble());
   }
 
   bool _trims(Paint paint) =>
@@ -530,61 +799,6 @@ class Lottie {
         ),
     ];
     return Track(baked);
-  }
-
-  /// The same group with every baked outline thinned to [tolerance].
-  Group _thinGroup(Group group, double tolerance) => Group(
-        group.name,
-        clip: group.clip == null ? null : Track(_thin(group.clip!.keys, tolerance)),
-        pivot: group.pivot,
-        translateX: group.translateX,
-        translateY: group.translateY,
-        scaleX: group.scaleX,
-        scaleY: group.scaleY,
-        rotation: group.rotation,
-        groups: [for (final child in group.groups) _thinGroup(child, tolerance)],
-        paths: [
-          for (final path in group.paths)
-            PathItem(path.name, Track(_thin(path.data.keys, tolerance)), path.paint),
-        ],
-      );
-
-  /// Douglas-Peucker on path data: a keyframe survives only where dropping it
-  /// would move the outline more than a hundredth of the artwork.
-  List<Key<List<Curve>>> _thin(List<Key<List<Curve>>> keys, double tolerance) {
-    if (keys.length < 3) return keys;
-    final keep = List<bool>.filled(keys.length, false);
-    keep[0] = keep[keys.length - 1] = true;
-    void split(int a, int b) {
-      if (b - a < 2) return;
-      var worst = -1;
-      var error = tolerance;
-      for (var i = a + 1; i < b; i++) {
-        final t = (keys[i].timeMs - keys[a].timeMs) / (keys[b].timeMs - keys[a].timeMs);
-        var local = 0.0;
-        for (var c = 0; c < keys[i].value.length; c++) {
-          for (var k = 0; k < keys[i].value[c].length; k++) {
-            final guess = keys[a].value[c][k] + (keys[b].value[c][k] - keys[a].value[c][k]) * t;
-            final d = (keys[i].value[c][k] - guess).length;
-            if (d > local) local = d;
-          }
-        }
-        if (local > error) {
-          error = local;
-          worst = i;
-        }
-      }
-      if (worst < 0) return;
-      keep[worst] = true;
-      split(a, worst);
-      split(worst, b);
-    }
-
-    split(0, keys.length - 1);
-    return [
-      for (var i = 0; i < keys.length; i++)
-        if (keep[i]) keys[i],
-    ];
   }
 
   int _time(num frames) => ((frames.toDouble() - inPoint) / frameRate * 1000).round();
@@ -721,54 +935,103 @@ class Lottie {
     return out;
   }
 
+  /// A rectangle, as Lottie draws one: from the top right, down the right
+  /// side, and round clockwise.
+  ///
+  /// The start point and the direction are not cosmetic - a trim measures from
+  /// the start - and the size, the centre and the corner radius can all
+  /// animate, so this is a track and not one shape. Every frame keeps the same
+  /// eight cubics, so the result can still morph: a square corner is a cubic
+  /// whose handles sit on the corner it turns.
   Track<List<Curve>> _rectTrack(Map<String, dynamic> item) {
-    final size = _pointAt(item['s']), centre = _pointAt(item['p']);
-    final rx = size.x / 2, ry = size.y / 2;
-    final corner = math.min(((_firstValue(item['r']) as num?) ?? 0).toDouble(), math.min(rx, ry));
-    final k = corner * 0.5523;
-    final left = centre.x - rx, right = centre.x + rx;
-    final top = centre.y - ry, bottom = centre.y + ry;
-    final curve = <Point>[Point(left + corner, top)];
-    void line(Point to) => curve.addAll([
-          curve.last + (to - curve.last) * (1 / 3),
-          curve.last + (to - curve.last) * (2 / 3),
-          to,
-        ]);
-    void arc(Point control1, Point control2, Point to) => curve.addAll([control1, control2, to]);
-    line(Point(right - corner, top));
-    arc(Point(right - corner + k, top), Point(right, top + corner - k), Point(right, top + corner));
-    line(Point(right, bottom - corner));
-    arc(Point(right, bottom - corner + k), Point(right - corner + k, bottom),
-        Point(right - corner, bottom));
-    line(Point(left + corner, bottom));
-    arc(Point(left + corner - k, bottom), Point(left, bottom - corner + k),
-        Point(left, bottom - corner));
-    line(Point(left, top + corner));
-    arc(Point(left, top + corner - k), Point(left + corner - k, top), Point(left + corner, top));
-    return Track.constant([curve]);
+    final width = _scalarTrack(item['s'], 1, 0), height = _scalarTrack(item['s'], 1, 1);
+    final x = _scalarTrack(item['p'], 1, 0), y = _scalarTrack(item['p'], 1, 1);
+    final round = _scalarTrack(item['r'] ?? 0, 1);
+    return _shapeTrack([width, height, x, y, round], (time) {
+      final halfWidth = width.at(time) / 2, halfHeight = height.at(time) / 2;
+      final centre = Point(x.at(time), y.at(time));
+      final corner = round.at(time).clamp(0.0, math.min(halfWidth, halfHeight));
+      final k = corner * (1 - _kappa);
+      final left = centre.x - halfWidth, right = centre.x + halfWidth;
+      final top = centre.y - halfHeight, bottom = centre.y + halfHeight;
+      final curve = <Point>[Point(right, top + corner)];
+      void line(Point to) => curve.addAll([
+            curve.last + (to - curve.last) * (1 / 3),
+            curve.last + (to - curve.last) * (2 / 3),
+            to,
+          ]);
+      void arc(Point handle1, Point handle2, Point to) => curve.addAll([handle1, handle2, to]);
+      line(Point(right, bottom - corner));
+      arc(Point(right, bottom - k), Point(right - k, bottom), Point(right - corner, bottom));
+      line(Point(left + corner, bottom));
+      arc(Point(left + k, bottom), Point(left, bottom - k), Point(left, bottom - corner));
+      line(Point(left, top + corner));
+      arc(Point(left, top + k), Point(left + k, top), Point(left + corner, top));
+      line(Point(right - corner, top));
+      arc(Point(right - k, top), Point(right, top + k), Point(right, top + corner));
+      return [curve];
+    });
   }
 
+  /// An ellipse, as Lottie draws one: from the top, clockwise, or the other way
+  /// round when the shape says it is reversed.
   Track<List<Curve>> _ellipseTrack(Map<String, dynamic> item) {
-    final size = _pointAt(item['s']), centre = _pointAt(item['p']);
-    final rx = size.x / 2, ry = size.y / 2, k = 0.5523;
-    return Track.constant([
-      [
-        Point(centre.x, centre.y - ry),
-        Point(centre.x + rx * k, centre.y - ry),
-        Point(centre.x + rx, centre.y - ry * k),
-        Point(centre.x + rx, centre.y),
-        Point(centre.x + rx, centre.y + ry * k),
-        Point(centre.x + rx * k, centre.y + ry),
-        Point(centre.x, centre.y + ry),
-        Point(centre.x - rx * k, centre.y + ry),
-        Point(centre.x - rx, centre.y + ry * k),
-        Point(centre.x - rx, centre.y),
-        Point(centre.x - rx, centre.y - ry * k),
-        Point(centre.x - rx * k, centre.y - ry),
-        Point(centre.x, centre.y - ry),
-      ],
+    final width = _scalarTrack(item['s'], 1, 0), height = _scalarTrack(item['s'], 1, 1);
+    final x = _scalarTrack(item['p'], 1, 0), y = _scalarTrack(item['p'], 1, 1);
+    final reversed = item['d'] == 3;
+    return _shapeTrack([width, height, x, y], (time) {
+      final rx = width.at(time) / 2, ry = height.at(time) / 2;
+      final centre = Point(x.at(time), y.at(time));
+      final hx = rx * _kappa * (reversed ? -1 : 1);
+      final side = reversed ? -rx : rx;
+      final hy = ry * _kappa;
+      return [
+        [
+          Point(centre.x, centre.y - ry),
+          Point(centre.x + hx, centre.y - ry),
+          Point(centre.x + side, centre.y - hy),
+          Point(centre.x + side, centre.y),
+          Point(centre.x + side, centre.y + hy),
+          Point(centre.x + hx, centre.y + ry),
+          Point(centre.x, centre.y + ry),
+          Point(centre.x - hx, centre.y + ry),
+          Point(centre.x - side, centre.y + hy),
+          Point(centre.x - side, centre.y),
+          Point(centre.x - side, centre.y - hy),
+          Point(centre.x - hx, centre.y - ry),
+          Point(centre.x, centre.y - ry),
+        ],
+      ];
+    });
+  }
+
+  /// A primitive shape sampled wherever any of the properties that build it
+  /// has a key, keeping that key's own easing.
+  Track<List<Curve>> _shapeTrack(
+      List<Track<double>> properties, List<Curve> Function(int timeMs) build) {
+    if (properties.every((track) => track.isConstant)) return Track.constant(build(0));
+    final times = <int>{
+      for (final track in properties) ...track.keys.map((key) => key.timeMs),
+    }.toList()
+      ..sort();
+    return Track([
+      for (final time in times) Key(time, build(time), _turn(properties, time)),
     ]);
   }
+
+  /// The easing whichever property turns with at [timeMs].
+  Easing _turn(List<Track<double>> properties, int timeMs) {
+    for (final track in properties) {
+      final easing = turnAt(track, timeMs);
+      if (easing != null) return easing;
+    }
+    return Easing.linear;
+  }
+
+  /// The handle length that turns a quarter circle into a cubic, as Lottie
+  /// itself writes it: matching the renderer matters more here than the last
+  /// digit of the ideal value, because a trim measures along this curve.
+  static const _kappa = 0.55228;
 
   /// Several paths under one paint become one `<path>` of several subpaths.
   Track<List<Curve>> _merge(List<Track<List<Curve>>> tracks) {
@@ -797,29 +1060,11 @@ class Lottie {
 
   /// The product of two opacity tracks, keyed wherever either one turns: a
   /// `<group>` cannot carry opacity, so a group's is folded into its paints.
-  Track<double> _multiply(Track<double> a, Track<double> b) {
-    if (a.isConstant && b.isConstant) return Track.constant(a.first * b.first);
-    if (a.isConstant && a.first == 1) return b;
-    if (b.isConstant && b.first == 1) return a;
-    final times = <int>{...a.keys.map((k) => k.timeMs), ...b.keys.map((k) => k.timeMs)}.toList()
-      ..sort();
-    return Track([
-      for (final t in times)
-        Key(t, a.at(t) * b.at(t), _turnAt(a, t) ?? _turnAt(b, t) ?? Easing.linear),
-    ]);
-  }
-
-  Easing? _turnAt(Track<double> track, int timeMs) {
-    for (final key in track.keys) {
-      if (key.timeMs == timeMs && !key.easing.isLinear) return key.easing;
-    }
-    return null;
-  }
 
   /// Drops keys that repeat the value before them, and sorts by time.
-  List<Key<double>> _tidy(List<Key<double>> keys) {
+  List<Key<T>> _tidy<T>(List<Key<T>> keys) {
     keys.sort((a, b) => a.timeMs.compareTo(b.timeMs));
-    final out = <Key<double>>[keys.first];
+    final out = <Key<T>>[keys.first];
     for (final key in keys.skip(1)) {
       final last = out.last;
       if (key.timeMs == last.timeMs && key.value == last.value) continue;
@@ -849,4 +1094,198 @@ List<List<Curve>> outlinesOfGroup(Group group, int timeMs, {bool fillsOnly = tru
 
   walk(group, identity);
   return out;
+}
+
+/// Loops of one part of a matte, and whether the part adds to what the matte
+/// covers or takes away from it.
+typedef _Signed = ({List<Curve> loops, int sign});
+
+/// What a matte covers, as parts that can be evaluated at any instant.
+class _Matte {
+  const _Matte(this.parts);
+
+  final List<_MattePart> parts;
+
+  List<_Signed> at(int timeMs) {
+    final out = <_Signed>[];
+    for (final part in parts) {
+      part.emit(timeMs, identity, 1, out, live: true);
+    }
+    return out;
+  }
+}
+
+abstract class _MattePart {
+  void emit(int timeMs, Matrix parent, int sign, List<_Signed> out, {required bool live});
+}
+
+/// One path of a matte layer.
+///
+/// A part that is off screen is emitted collapsed to a point rather than
+/// dropped: a clip is morphed from keyframe to keyframe, and Android can only
+/// morph path data whose commands match, so the loop has to stay in the path
+/// and cover nothing.
+class _MatteLeaf implements _MattePart {
+  _MatteLeaf(this.stack, this.path);
+
+  final List<Group> stack;
+  final PathItem path;
+
+  @override
+  void emit(int timeMs, Matrix parent, int sign, List<_Signed> out, {required bool live}) {
+    var local = parent;
+    for (final group in stack) {
+      local = compose(local, group.matrixAt(timeMs));
+    }
+    final paint = path.paint;
+    final fills = live && paint.hasFill && paint.alpha.at(timeMs) >= 0.5;
+    final strokes = live && paint.hasStroke && paint.strokeAlpha.at(timeMs) >= 0.5;
+    final data = path.data.at(timeMs);
+    final start = paint.trimStart.at(timeMs), end = paint.trimEnd.at(timeMs);
+    final stroked = paint.hasStroke
+        ? trimCurves(data, start, end, paint.trimOffset.at(timeMs))
+        : const <Curve>[];
+    final loops = <(Curve, bool)>[
+      if (paint.hasFill)
+        for (final curve in data)
+          (
+            paint.hasStroke ? outsetLoop(curve, paint.strokeWidth.at(timeMs) / 2) : curve,
+            fills || strokes,
+          ),
+      if (paint.hasStroke && !paint.hasFill)
+        for (final curve in stroked) (_strokeBand(curve, paint.strokeWidth.at(timeMs)), strokes),
+    ];
+    out.add((
+      loops: [
+        for (final loop in loops)
+          if (loop.$2)
+            [for (final point in loop.$1) transform(local, point)]
+          else
+            [for (var i = 0; i < loop.$1.length; i++) transform(local, loop.$1.first)],
+      ],
+      sign: sign,
+    ));
+  }
+}
+
+Curve _lineLoop(List<Point> points) {
+  if (points.length < 2) return const [];
+  final loop = <Point>[points.first];
+  for (var i = 0; i < points.length; i++) {
+    final from = points[i], to = points[(i + 1) % points.length];
+    loop.addAll([from + (to - from) * (1 / 3), from + (to - from) * (2 / 3), to]);
+  }
+  return loop;
+}
+
+Curve _strokeBand(Curve curve, double width) {
+  const steps = 6;
+  final line = <Point>[];
+  for (var segment = 0; segment < (curve.length - 1) ~/ 3; segment++) {
+    final p0 = curve[segment * 3], p1 = curve[segment * 3 + 1];
+    final p2 = curve[segment * 3 + 2], p3 = curve[segment * 3 + 3];
+    for (var step = segment == 0 ? 0 : 1; step <= steps; step++) {
+      final t = step / steps, u = 1 - t;
+      line.add(p0 * (u * u * u) + p1 * (3 * u * u * t) + p2 * (3 * u * t * t) + p3 * (t * t * t));
+    }
+  }
+  if (line.isEmpty) return const [];
+  final half = width / 2;
+  List<Point> side(double distance) {
+    return [
+      for (var i = 0; i < line.length; i++)
+        () {
+          var before = i, after = i;
+          while (before > 0 && (line[before] - line[i]).length <= 1e-9) {
+            before--;
+          }
+          while (after + 1 < line.length && (line[after] - line[i]).length <= 1e-9) {
+            after++;
+          }
+          final run = line[after] - line[before], length = run.length;
+          return length <= 1e-9
+              ? line[i]
+              : line[i] + Point(run.y / length, -run.x / length) * distance;
+        }(),
+    ];
+  }
+
+  return _lineLoop([...side(half), ...side(-half).reversed]);
+}
+
+/// A precomposition inside a matte: its own transform, its window, what it
+/// covers, and what a matte of its own removes from it.
+class _MatteNest implements _MattePart {
+  _MatteNest(this.stack, this.window, this.content, this.remove);
+
+  final List<Group> stack;
+  final Track<double> window;
+  final _Matte content;
+  final _Matte? remove;
+
+  @override
+  void emit(int timeMs, Matrix parent, int sign, List<_Signed> out, {required bool live}) {
+    var local = parent;
+    for (final group in stack) {
+      local = compose(local, group.matrixAt(timeMs));
+    }
+    final inside = live && window.at(timeMs) >= 0.5;
+    for (final part in content.parts) {
+      part.emit(timeMs, local, sign, out, live: inside);
+    }
+    for (final part in remove?.parts ?? const <_MattePart>[]) {
+      part.emit(timeMs, local, -sign, out, live: inside);
+    }
+  }
+}
+
+/// Signed area of the widest loop in a set: which way the part turns.
+double _outerArea(List<List<Point>> loops) {
+  var widest = 0.0;
+  for (final loop in loops) {
+    final area = signedArea(flattenLoop(loop));
+    if (area.abs() > widest.abs()) widest = area;
+  }
+  return widest;
+}
+
+/// A cubic read by arc length, the way Lottie walks a motion path.
+///
+/// A bezier's parameter is not its length: the same step in `t` covers more
+/// ground where the curve is straight. Lottie measures the path and reads the
+/// point at a fraction of its length, so the table here does the same.
+class _Arc {
+  _Arc(this.curve) {
+    var last = curve.first;
+    for (var i = 1; i <= _steps; i++) {
+      final point = _at(i / _steps);
+      _lengths.add(_lengths.last + (point - last).length);
+      last = point;
+    }
+  }
+
+  static const _steps = 64;
+  final List<Point> curve;
+  final List<double> _lengths = [0];
+
+  Point at(double fraction) {
+    final total = _lengths.last;
+    if (total == 0) return curve.first;
+    final target = (fraction * total).clamp(0.0, total);
+    for (var i = 1; i < _lengths.length; i++) {
+      if (target > _lengths[i]) continue;
+      final span = _lengths[i] - _lengths[i - 1];
+      final inside = span == 0 ? 0.0 : (target - _lengths[i - 1]) / span;
+      return _at((i - 1 + inside) / _steps);
+    }
+    return curve.last;
+  }
+
+  Point _at(double t) {
+    final u = 1 - t;
+    return curve[0] * (u * u * u) +
+        curve[1] * (3 * u * u * t) +
+        curve[2] * (3 * u * t * t) +
+        curve[3] * (t * t * t);
+  }
 }
