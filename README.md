@@ -13,15 +13,15 @@ the animation's own, not the recording's:
 
 ### Lottie — 3.97s
 
-[![Lottie demo](doc/demo_lottie.gif)](doc/demo_lottie.mp4)
+[![Lottie demo](https://raw.githubusercontent.com/udyan-dev/android_avd_splash/main/doc/demo_lottie.gif)](https://raw.githubusercontent.com/udyan-dev/android_avd_splash/main/doc/demo_lottie.mp4)
 
 ### Animated SVG — 4.57s
 
-[![Animated SVG demo](doc/demo_svg.gif)](doc/demo_svg.mp4)
+[![Animated SVG demo](https://raw.githubusercontent.com/udyan-dev/android_avd_splash/main/doc/demo_svg.gif)](https://raw.githubusercontent.com/udyan-dev/android_avd_splash/main/doc/demo_svg.mp4)
 
 ### Animated GIF — 2.03s
 
-[![Animated GIF demo](doc/demo_gif.gif)](doc/demo_gif.mp4)
+[![Animated GIF demo](https://raw.githubusercontent.com/udyan-dev/android_avd_splash/main/doc/demo_gif.gif)](https://raw.githubusercontent.com/udyan-dev/android_avd_splash/main/doc/demo_gif.mp4)
 
 ```sh
 dart pub add dev:android_avd_splash

@@ -1,3 +1,8 @@
+## 1.1.3
+
+- Changed the demo previews and full-resolution video links to absolute HTTPS
+  URLs so pub.dev can render them from the package README.
+
 ## 1.1.2
 
 - Re-recorded the Lottie, animated SVG and animated GIF splash demos at the
