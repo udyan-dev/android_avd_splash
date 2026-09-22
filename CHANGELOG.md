@@ -1,3 +1,10 @@
+## 1.1.2
+
+- Re-recorded the Lottie, animated SVG and animated GIF splash demos at the
+  device's native 1440x2960 resolution and 60 fps.
+- Added animated previews to the package README, linked to the full-resolution
+  recordings.
+
 ## 1.1.0
 
 Animated SVG joins Lottie and GIF as a source, and the output is now checked

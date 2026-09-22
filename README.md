@@ -5,22 +5,23 @@ Turns a Lottie animation, an animated SVG or an animated GIF into an Android
 needs around it, and the two edits that connect them to your launcher
 activity. One configuration file, one command.
 
-Recorded from release builds at the device's own 1440x2960. Each one starts on
-the home screen, shows the tap and the launch transition, plays the drawable
-for the source's full length, and ends after the app takes over. The time in
-brackets is the animation's own, not the recording's:
+Recorded from release builds at the device's own 1440x2960 and 60 fps. Each
+one starts on the home screen, shows the tap and the launch transition, plays
+the drawable for the source's full length, and ends after the app takes over.
+Select a preview to open the full-resolution video. The time in brackets is
+the animation's own, not the recording's:
 
 ### Lottie — 3.97s
 
-[![Lottie demo](doc/demo_lottie.gif)](https://github.com/user-attachments/assets/05937505-c7cd-403c-9101-80b949de17e3)
+[![Lottie demo](doc/demo_lottie.gif)](doc/demo_lottie.mp4)
 
 ### Animated SVG — 4.57s
 
-[![Animated SVG demo](doc/demo_svg.gif)](https://github.com/user-attachments/assets/812cdd4d-e3b8-4144-b521-b3b98ada72d0)
+[![Animated SVG demo](doc/demo_svg.gif)](doc/demo_svg.mp4)
 
 ### Animated GIF — 2.03s
 
-[![Animated GIF demo](doc/demo_gif.gif)](https://github.com/user-attachments/assets/0a9d990e-1b2b-4bef-be92-5eb1cdec6766)
+[![Animated GIF demo](doc/demo_gif.gif)](doc/demo_gif.mp4)
 
 ```sh
 dart pub add dev:android_avd_splash
